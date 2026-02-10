@@ -1,0 +1,20 @@
+# --- Security (CRITICAL) ---
+.env
+# Never upload .env to GitHub. It contains your Mongo URI and Twilio keys.
+
+# --- Compiled Python Files (Junk) ---
+__pycache__/
+*.pyc
+
+# --- Tools & Executables ---
+ngrok.exe
+# No need to upload the ngrok tool, it's just for local testing.
+
+# --- Virtual Environment (If you have one) ---
+venv/
+env/
+.venv/
+
+# --- IDE Settings (Optional but good practice) ---
+.vscode/
+.idea/
