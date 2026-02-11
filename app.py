@@ -49,7 +49,7 @@ twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID else None
 
 # --- MODELS ---
 class SensorAlert(BaseModel):
-    vehicle_id: str         # Format: "Maruti_V11" OR just "V11"
+    vehicle_id: str         # Format: "Maruti_V11" OR jus  t "V11"
     issue_detected: str     
 
 # --- API ENDPOINTS ---
