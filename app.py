@@ -5,7 +5,9 @@ from fastapi.responses import PlainTextResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from twilio.rest import Client
 import os
-from datetime import datetime
+import httpx  # <--- NEW: For calling external APIs
+import random # <--- NEW: For generating dummy confirmation codes
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from bson import ObjectId
 
@@ -15,9 +17,10 @@ load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
 TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-# Note: For WhatsApp Sandbox, this is usually +14155238886
-# Check
 TWILIO_WHATSAPP_NUMBER = "whatsapp:+14155238886" 
+
+# External Booking API URL
+BOOKING_API_URL = "https://booking-and-log-service-ey.onrender.com/book-service"
 
 # 1. Initialize FastAPI App
 app = FastAPI()
@@ -31,15 +34,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 3. Connect to Database (HANDLING TWO DATABASES)
+# 3. Connect to Database
 client = AsyncIOMotorClient(MONGO_URI)
-
-# Database 1: Auto AI (For Service Centers & SMS Sessions)
 db_auto = client["auto_ai_db"] 
 admin_collection = db_auto.service_centers
 sms_sessions = db_auto.sms_sessions
-
-# Database 2: Techathon (For Vehicles & Users)
 db_tech = client["techathon_db"]
 vehicle_collection = db_tech.vehicles
 users_collection = db_tech.users
@@ -49,7 +48,7 @@ twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID else None
 
 # --- MODELS ---
 class SensorAlert(BaseModel):
-    vehicle_id: str         # Format: "Maruti_V11" OR jus  t "V11"
+    vehicle_id: str
     issue_detected: str     
 
 # --- API ENDPOINTS ---
@@ -57,36 +56,25 @@ class SensorAlert(BaseModel):
 @app.post("/sensor-anomaly")
 async def sensor_anomaly_alert(alert: SensorAlert):
     if not twilio_client:
-        print("❌ DEBUG: Twilio Client is None. Check env variables.")
         raise HTTPException(status_code=500, detail="Twilio not configured")
 
-    # --- 1. FETCH OWNER PHONE FROM DB ---
-    print(f"🔍 DEBUG: Looking up owner for vehicle: {alert.vehicle_id} in 'techathon_db'")
+    # --- 1. FETCH DETAILS ---
+    print(f"🔍 DEBUG: Looking up owner for: {alert.vehicle_id}")
     
-    # A. Get User ID from Vehicle
     vehicle = await vehicle_collection.find_one({"vehicle_id": alert.vehicle_id.strip()})
-    
     if not vehicle:
-        print(f"❌ DEBUG: Vehicle '{alert.vehicle_id}' not found in techathon_db.")
         return {"status": "error", "message": "Vehicle ID not registered."}
     
     user_id = vehicle.get("user_id")
     db_company_name = vehicle.get("model") 
-    
-    print(f"✅ DEBUG: Found Vehicle. Owner: {user_id}, Model: {db_company_name}")
 
-    # B. Get Phone from User
     user = await users_collection.find_one({"user_id": user_id})
     if not user:
-        print(f"❌ DEBUG: User {user_id} not found.")
         return {"status": "error", "message": "Vehicle owner not found."}
 
-    # C. Set the variable
     owner_phone = user.get("phone")
-    if not owner_phone:
-        return {"status": "error", "message": "User has no phone number."}
-
-    # --- 2. DETERMINE COMPANY NAME ---
+    
+    # --- 2. DETERMINE COMPANY ---
     company_name = None
     if "_" in alert.vehicle_id:
         company_name = alert.vehicle_id.split("_")[0]
@@ -95,43 +83,34 @@ async def sensor_anomaly_alert(alert: SensorAlert):
     else:
         return {"status": "error", "message": "Could not determine company name."}
 
-    # --- 3. FIND SERVICE CENTERS ---
-    print(f"🔍 DEBUG: Searching centers for: '{company_name}'")
-    
+    # --- 3. FIND CENTERS ---
     centers_cursor = admin_collection.find({
         "company_name": {"$regex": f"^{company_name}", "$options": "i"}
     })
-    
-    # Fetch up to 5 centers
     centers = await centers_cursor.to_list(length=5)
 
     if not centers:
-        print(f"⚠️ DEBUG: No centers found for {company_name}")
         return {"status": "warning", "message": f"No service centers found for {company_name}"}
 
-    # --- 4. BUILD MULTI-OPTION MESSAGE ---
+    # --- 4. BUILD MESSAGE & SAVE SESSION ---
     menu_text = f"🚨 *ALERT:* {alert.issue_detected} detected for {alert.vehicle_id}.\n\n"
     menu_text += f"Select a {company_name} Service Center:\n"
     
     session_options = {} 
     
-    # Loop through ALL found centers
     for index, center in enumerate(centers, 1):
-        # We assume every center has a 'centerId' field based on your screenshot
         custom_id = center.get("centerId", "UnknownID")
-        
         menu_text += f"{index}. {center['name']} ({center['location']})\n"
-        
-        # STORE THE CUSTOM ID (e.g., "C431") INSTEAD OF OBJECT_ID
         session_options[str(index)] = str(custom_id)
     
     menu_text += "\nReply with the center number to book."
 
-    # --- 5. SAVE SESSION ---
+    # ✅ UPDATED: Saving 'user_id' in session so we can use it for booking later
     await sms_sessions.update_one(
         {"phone": owner_phone}, 
         {"$set": {
             "vehicle_id": alert.vehicle_id,
+            "user_id": user_id,  # <--- CRITICAL NEW FIELD
             "issue": alert.issue_detected,
             "options": session_options,
             "timestamp": datetime.now()
@@ -139,68 +118,96 @@ async def sensor_anomaly_alert(alert: SensorAlert):
         upsert=True 
     )
 
-    # --- 6. SEND WHATSAPP ---
-    to_whatsapp = f"whatsapp:{owner_phone}"
-    
-    print(f"\n--- 🐛 DEBUGGING WHATSAPP ---")
-    print(f"TO: {to_whatsapp}")
-    print(f"MSG: \n{menu_text}")
-    print(f"------------------------\n")
-
+    # --- 5. SEND WHATSAPP ---
     try:
         message = twilio_client.messages.create(
             body=menu_text,
             from_=TWILIO_WHATSAPP_NUMBER,
-            to=to_whatsapp
+            to=f"whatsapp:{owner_phone}"
         )
-        print(f"✅ SUCCESS: WhatsApp Sent. SID: {message.sid}")
-        return {
-            "status": "success", 
-            "message": "WhatsApp sent to owner", 
-            "sid": message.sid, 
-            "centers_found": len(centers)
-        }
+        print(f"✅ ALERT SENT. SID: {message.sid}")
+        return {"status": "success", "centers_found": len(centers)}
     except Exception as e:
         print(f"❌ ERROR: Twilio failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to send WhatsApp: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sms-reply")
 async def sms_reply(From: str = Form(...), Body: str = Form(...)):
     """
-    Webhook for Twilio to call when User replies
+    Handles User Reply -> Calls External Booking API -> Confirms to User
     """
-    # 1. Clean the phone number (Remove 'whatsapp:' prefix)
     raw_phone = From
     user_phone = raw_phone.replace("whatsapp:", "").strip()
     user_choice = Body.strip()
 
-    print(f"📩 REPLY RECEIVED from {user_phone}: '{user_choice}'")
+    print(f"📩 REPLY from {user_phone}: '{user_choice}'")
 
-    # 2. Find the active session
+    # 1. Retrieve Session
     session = await sms_sessions.find_one({"phone": user_phone})
-
     if not session:
-        print(f"❌ DEBUG: No session found for {user_phone}")
-        return PlainTextResponse("No active service request found. Please wait for a new alert.")
+        return PlainTextResponse("Session expired. Please wait for a new alert.")
 
-    # 3. Check if choice is valid
-    # This will now return "C431" instead of the MongoDB ObjectId
     selected_center_id = session.get("options", {}).get(user_choice)
 
     if selected_center_id:
-        print(f"✅ BOOKING CONFIRMED! User selected Center ID: {selected_center_id}")
+        print(f"✅ USER SELECTED CENTER: {selected_center_id}")
         
-        # 4. Fetch center details using the CUSTOM ID (centerId)
-        # We query by "centerId", NOT "_id"
+        # 2. Prepare Data for External API
+        vehicle_id = session.get("vehicle_id")
+        user_id = session.get("user_id", "UNKNOWN_USER")
+        
+        # Generate a dummy future date (e.g., Tomorrow at 10 AM)
+        tomorrow = datetime.utcnow() + timedelta(days=1)
+        booking_time = tomorrow.replace(hour=10, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        # Generate a dummy confirmation code
+        conf_code = f"CONF-{random.randint(100, 999)}"
+
+        # Construct the Payload
+        booking_payload = {
+            "vehicleId": vehicle_id,
+            "confirmationCode": conf_code,
+            "status": "CONFIRMED",
+            "scheduledService": {
+                "isScheduled": True,
+                "serviceCenterId": selected_center_id, # The ID user selected (e.g., C431)
+                "dateTime": booking_time
+            },
+            "userId": user_id
+        }
+
+        print(f"🚀 CALLING EXTERNAL API: {BOOKING_API_URL}")
+        print(f"📦 PAYLOAD: {booking_payload}")
+
+        # 3. Call External API
+        api_success = False
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(BOOKING_API_URL, json=booking_payload)
+                
+                print(f"📡 API RESPONSE CODE: {response.status_code}")
+                print(f"📡 API RESPONSE BODY: {response.text}")
+                
+                if response.status_code in [200, 201]:
+                    api_success = True
+                else:
+                    print("❌ External API failed to book.")
+
+        except Exception as e:
+            print(f"❌ EXCEPTION Calling API: {e}")
+
+        # 4. Fetch Center Name for Display
         center = await admin_collection.find_one({"centerId": selected_center_id})
-        
         center_name = center['name'] if center else "the service center"
 
-        # 5. Success Response
-        response_msg = f"✅ Confirmed! Booking request received for {center_name} (ID: {selected_center_id}). We are processing it now."
+        # 5. Send Final Reply to User
+        if api_success:
+            response_msg = f"✅ BOOKING SUCCESSFUL!\n\nService scheduled at {center_name} (ID: {selected_center_id})\n📅 Date: {booking_time}\n🔑 Code: {conf_code}\n\nDrive safely!"
+        else:
+            response_msg = f"⚠️ Booking initiated for {center_name}, but the external system is slow. We will confirm shortly via email."
+
         return PlainTextResponse(response_msg)
     
     else:
-        # Generic error message
-        return PlainTextResponse("Invalid option. Please reply with the number corresponding to your choice.")
+        return PlainTextResponse("Invalid option. Please reply with the number (e.g., 1).")
