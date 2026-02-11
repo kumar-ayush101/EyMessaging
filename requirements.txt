@@ -6,3 +6,4 @@ twilio
 python-dotenv
 dnspython
 python-multipart  
+httpx
