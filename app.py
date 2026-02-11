@@ -16,6 +16,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 # Note: For WhatsApp Sandbox, this is usually +14155238886
+# Check
 TWILIO_WHATSAPP_NUMBER = "whatsapp:+14155238886" 
 
 # 1. Initialize FastAPI App
