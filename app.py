@@ -25,6 +25,17 @@ BOOKING_API_URL = "https://booking-and-log-service-ey.onrender.com/book-service"
 # 1. Initialize FastAPI App
 app = FastAPI()
 
+@app.get("/")
+async def health_check():
+    """
+    This route is for the cron job to keep the server awake.
+    """
+    return {
+        "status": "online",
+        "timestamp": datetime.now(),
+        "message": "Messaging API is active"
+    }
+
 # 2. Enable CORS
 app.add_middleware(
     CORSMiddleware,
