@@ -10,7 +10,7 @@ import random
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from bson import ObjectId
-from typing import Optional # <--- NEW: Needed for optional 'mode'
+from typing import Optional 
 
 load_dotenv()
 
@@ -62,7 +62,7 @@ twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID else None
 class SensorAlert(BaseModel):
     vehicle_id: str
     issue_detected: str     
-    mode: Optional[str] = "manual"  # <--- NEW: Accepts mode from Flask
+    mode: Optional[str] = "manual"  
 
 # --- API ENDPOINTS ---
 
@@ -98,7 +98,6 @@ async def sensor_anomaly_alert(alert: SensorAlert):
 
     # --- 3. AUTO MODE LOGIC ---
     if alert.mode == "auto":
-        # Find just the nearest/first center for Auto
         centers_cursor = admin_collection.find({
             "company_name": {"$regex": f"^{company_name}", "$options": "i"}
         })
@@ -121,14 +120,14 @@ async def sensor_anomaly_alert(alert: SensorAlert):
                 "vehicle_id": alert.vehicle_id,
                 "user_id": user_id,
                 "issue": alert.issue_detected,
-                "auto_center_id": center_id, # Store auto-selected center
-                "state": "WAITING_FOR_DATETIME", # <--- NEW: State tracking
+                "selected_center_id": center_id, # <--- CHANGED: Unified variable name
+                "state": "WAITING_FOR_DATETIME", 
                 "timestamp": datetime.now()
             }},
             upsert=True 
         )
 
-    # --- 4. MANUAL MODE LOGIC (Original) ---
+    # --- 4. MANUAL MODE LOGIC ---
     else:
         centers_cursor = admin_collection.find({
             "company_name": {"$regex": f"^{company_name}", "$options": "i"}
@@ -156,7 +155,7 @@ async def sensor_anomaly_alert(alert: SensorAlert):
                 "user_id": user_id, 
                 "issue": alert.issue_detected,
                 "options": session_options,
-                "state": "WAITING_FOR_CENTER", # <--- NEW: State tracking
+                "state": "WAITING_FOR_CENTER", 
                 "timestamp": datetime.now()
             }},
             upsert=True 
@@ -192,70 +191,86 @@ async def sms_reply(From: str = Form(...), Body: str = Form(...)):
     if not session:
         return PlainTextResponse("Session expired. Please wait for a new alert.")
 
-    state = session.get("state", "WAITING_FOR_CENTER") # Fallback to manual if no state
+    state = session.get("state", "WAITING_FOR_CENTER") 
     
-    # Setup variables needed for API
-    vehicle_id = session.get("vehicle_id")
-    user_id = session.get("user_id", "UNKNOWN_USER")
-    conf_code = f"CONF-{random.randint(100, 999)}"
-    
-    # We generate a dummy ISO date for the backend API so it doesn't crash on natural language
-    tomorrow = datetime.utcnow() + timedelta(days=1)
-    api_booking_time = tomorrow.replace(hour=10, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
-
     # --- IF STATE IS MANUAL (Waiting for Center Number) ---
     if state == "WAITING_FOR_CENTER":
         selected_center_id = session.get("options", {}).get(user_choice)
         if not selected_center_id:
             return PlainTextResponse("Invalid option. Please reply with the number (e.g., 1).")
         
-        print(f"✅ USER SELECTED CENTER: {selected_center_id}")
-        display_time = api_booking_time # Show dummy time for manual
+        # Fetch center name to make the WhatsApp reply look nice
+        center = await admin_collection.find_one({"centerId": selected_center_id})
+        center_name = center['name'] if center else "the selected service center"
+
+        print(f"✅ USER SELECTED CENTER: {selected_center_id}. Advancing state.")
+        
+        # Step 2 of Manual Mode: Ask for time and update the session state
+        await sms_sessions.update_one(
+            {"phone": user_phone},
+            {"$set": {
+                "state": "WAITING_FOR_DATETIME",
+                "selected_center_id": selected_center_id # Save their choice for the next step
+            }}
+        )
+        
+        # Return a message asking for the time (does NOT trigger external API yet)
+        return PlainTextResponse(f"✅ You selected {center_name}.\n\nPlease reply with the *Date and Time* you are free for the service (e.g., 'Tomorrow at 10 AM', 'Oct 25 at 2 PM').")
     
-    # --- IF STATE IS AUTO (Waiting for Date/Time) ---
+    
+    # --- IF STATE IS AUTO OR MANUAL-STEP-2 (Waiting for Date/Time) ---
     elif state == "WAITING_FOR_DATETIME":
-        selected_center_id = session.get("auto_center_id")
-        display_time = user_choice # Show their requested time in the WhatsApp response!
+        selected_center_id = session.get("selected_center_id")
+        display_time = user_choice # The text they just typed (e.g., "Tomorrow at 10")
         print(f"✅ USER REQUESTED TIME: {display_time} AT CENTER: {selected_center_id}")
 
-    # Construct the Payload for External API
-    booking_payload = {
-        "vehicleId": vehicle_id,
-        "confirmationCode": conf_code,
-        "status": "CONFIRMED",
-        "scheduledService": {
-            "isScheduled": True,
-            "serviceCenterId": selected_center_id, 
-            "dateTime": api_booking_time # Send ISO time to backend
-        },
-        "userId": user_id
-    }
+        # Setup variables needed for External API
+        vehicle_id = session.get("vehicle_id")
+        user_id = session.get("user_id", "UNKNOWN_USER")
+        conf_code = f"CONF-{random.randint(100, 999)}"
+        
+        # We generate a dummy ISO date for the backend API so it doesn't crash on natural language
+        tomorrow = datetime.utcnow() + timedelta(days=1)
+        api_booking_time = tomorrow.replace(hour=10, minute=0, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    print(f"🚀 CALLING EXTERNAL API: {BOOKING_API_URL}")
+        # Construct the Payload for External API
+        booking_payload = {
+            "vehicleId": vehicle_id,
+            "confirmationCode": conf_code,
+            "status": "CONFIRMED",
+            "scheduledService": {
+                "isScheduled": True,
+                "serviceCenterId": selected_center_id, 
+                "dateTime": api_booking_time # Send ISO time to backend
+            },
+            "userId": user_id
+        }
 
-    # Call External API
-    api_success = False
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(BOOKING_API_URL, json=booking_payload)
-            if response.status_code in [200, 201]:
-                api_success = True
-            else:
-                print("❌ External API failed to book.")
-    except Exception as e:
-        print(f"❌ EXCEPTION Calling API: {e}")
+        print(f"🚀 CALLING EXTERNAL API: {BOOKING_API_URL}")
 
-    # Fetch Center Name for Display
-    center = await admin_collection.find_one({"centerId": selected_center_id})
-    center_name = center['name'] if center else "the service center"
+        # Call External API
+        api_success = False
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(BOOKING_API_URL, json=booking_payload)
+                if response.status_code in [200, 201]:
+                    api_success = True
+                else:
+                    print("❌ External API failed to book.")
+        except Exception as e:
+            print(f"❌ EXCEPTION Calling API: {e}")
 
-    # Send Final Reply to User
-    if api_success:
-        response_msg = f"✅ BOOKING SUCCESSFUL!\n\nService scheduled at {center_name}\n📅 Time: {display_time}\n🔑 Code: {conf_code}\n\nDrive safely!"
-    else:
-        response_msg = f"⚠️ Booking initiated for {center_name} at {display_time}, but the system is slow. We will confirm shortly via email."
+        # Fetch Center Name for Display
+        center = await admin_collection.find_one({"centerId": selected_center_id})
+        center_name = center['name'] if center else "the service center"
 
-    # Optional: Clear the session so they don't double-book
-    await sms_sessions.delete_one({"phone": user_phone})
+        # Send Final Reply to User
+        if api_success:
+            response_msg = f"✅ BOOKING SUCCESSFUL!\n\nService scheduled at {center_name}\n📅 Time: {display_time}\n🔑 Code: {conf_code}\n\nDrive safely!"
+        else:
+            response_msg = f"⚠️ Booking initiated for {center_name} at {display_time}, but the system is slow. We will confirm shortly via email."
 
-    return PlainTextResponse(response_msg)
+        # Clear the session so they don't double-book
+        await sms_sessions.delete_one({"phone": user_phone})
+
+        return PlainTextResponse(response_msg)
